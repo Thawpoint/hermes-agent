@@ -524,6 +524,10 @@ def _handle_block(args: dict, **kw) -> str:
     reason = args.get("reason")
     if not reason or not str(reason).strip():
         return tool_error("reason is required — explain what input you need")
+    human_gate, bool_error = _parse_bool_arg(args, "human_gate")
+    if bool_error:
+        return tool_error(bool_error)
+    reason_category = args.get("reason_category")
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
@@ -532,6 +536,8 @@ def _handle_block(args: dict, **kw) -> str:
                 conn, tid,
                 reason=reason,
                 expected_run_id=_worker_run_id(tid),
+                human_gate=human_gate,
+                reason_category=reason_category,
             )
             if not ok:
                 return tool_error(
@@ -985,6 +991,33 @@ KANBAN_BLOCK_SCHEMA = {
                     "What you need answered, in one or two sentences. "
                     "Don't paste the whole conversation; the human has "
                     "the board and can ask follow-ups via comments."
+                ),
+            },
+            "human_gate": {
+                "type": "boolean",
+                "description": (
+                    "Set true only for a genuine first-run human gate: "
+                    "missing credentials, a human/product/art decision, "
+                    "approval for destructive action, or permission for "
+                    "a service interruption. Do not use this to park "
+                    "routine implementation handoffs; use kanban_complete "
+                    "with review metadata for those."
+                ),
+            },
+            "reason_category": {
+                "type": "string",
+                "enum": [
+                    "credential",
+                    "human_decision",
+                    "destructive_action",
+                    "service_interruption",
+                    "product_decision",
+                    "art_decision",
+                ],
+                "description": (
+                    "Optional explicit human-gate category. Providing a "
+                    "category marks this block as a human gate even if "
+                    "human_gate is omitted."
                 ),
             },
             "board": _board_schema_prop(),

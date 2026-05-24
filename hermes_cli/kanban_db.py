@@ -266,6 +266,57 @@ BLOCKED_REVIEW_PREREQUISITE_ERROR = (
     "in task history"
 )
 
+HUMAN_GATE_BLOCK_REASON_CATEGORIES = (
+    "credential",
+    "human_decision",
+    "destructive_action",
+    "service_interruption",
+    "product_decision",
+    "art_decision",
+)
+
+_HUMAN_GATE_BLOCK_REASON_ALIASES = {
+    "credentials": "credential",
+    "secret": "credential",
+    "secrets": "credential",
+    "human": "human_decision",
+    "decision": "human_decision",
+    "human_input": "human_decision",
+    "input": "human_decision",
+    "destructive": "destructive_action",
+    "destructive_actions": "destructive_action",
+    "restart": "service_interruption",
+    "service": "service_interruption",
+    "outage": "service_interruption",
+    "product": "product_decision",
+    "art": "art_decision",
+    "creative": "art_decision",
+}
+
+
+def _normalize_human_gate_reason_category(
+    reason_category: Optional[str],
+) -> Optional[str]:
+    if reason_category is None:
+        return None
+    normalized = (
+        str(reason_category)
+        .strip()
+        .lower()
+        .replace("-", "_")
+        .replace(" ", "_")
+    )
+    if not normalized:
+        return None
+    normalized = _HUMAN_GATE_BLOCK_REASON_ALIASES.get(normalized, normalized)
+    if normalized not in HUMAN_GATE_BLOCK_REASON_CATEGORIES:
+        allowed = ", ".join(HUMAN_GATE_BLOCK_REASON_CATEGORIES)
+        raise ValueError(
+            f"Invalid human-gate reason category {reason_category!r}. "
+            f"Allowed categories: {allowed}"
+        )
+    return normalized
+
 
 def _latest_review_request_payload(conn: sqlite3.Connection, task_id: str) -> Optional[dict]:
     row = conn.execute(
@@ -3978,13 +4029,21 @@ def block_task(
     reason: Optional[str] = None,
     expected_run_id: Optional[int] = None,
     enforce_review_prerequisite: bool = True,
+    human_gate: bool = False,
+    reason_category: Optional[str] = None,
 ) -> bool:
     """Transition ``running -> blocked``.
 
     User/operator initiated blocked transitions must have enough review
-    history. Internal dispatcher safety blocks (for example impossible skill
-    preloads) can opt out so existing system-protection behavior is preserved.
+    history unless the caller explicitly marks the block as a genuine
+    human gate (credential, human decision, destructive-action approval,
+    service interruption, or product/art decision). Internal dispatcher
+    safety blocks (for example impossible skill preloads) can opt out via
+    ``enforce_review_prerequisite=False`` so existing system-protection
+    behavior is preserved.
     """
+    normalized_reason_category = _normalize_human_gate_reason_category(reason_category)
+    is_human_gate = bool(human_gate or normalized_reason_category)
     review_payload = _latest_review_request_payload(conn, task_id)
     return_assignee = None
     reviewer = _reviewer_profile()
@@ -4026,7 +4085,7 @@ def block_task(
                     attempted_run_id=int(expected_run_id),
                 )
             return False
-        if enforce_review_prerequisite:
+        if enforce_review_prerequisite and not is_human_gate:
             _ensure_blocked_transition_allowed(conn, task_id)
         assignee_sql = ", assignee = ?" if return_assignee else ""
         if expected_run_id is None:
@@ -4080,7 +4139,11 @@ def block_task(
                 outcome="blocked",
                 summary=reason,
             )
-        payload = {"reason": reason}
+        payload: dict = {"reason": reason}
+        if is_human_gate:
+            payload["human_gate"] = True
+            if normalized_reason_category:
+                payload["reason_category"] = normalized_reason_category
         if return_assignee:
             payload.update({"source": "review", "return_assignee": return_assignee})
         _append_event(conn, task_id, "blocked", payload, run_id=run_id)

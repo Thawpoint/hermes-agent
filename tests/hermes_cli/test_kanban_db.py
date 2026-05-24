@@ -3467,6 +3467,78 @@ def test_block_task_denies_one_prior_review_visit(kanban_home):
         assert [e.kind for e in kb.list_events(conn, task_id)].count("blocked") == 0
 
 
+@pytest.mark.parametrize(
+    "reason_category",
+    [
+        "credential",
+        "human_decision",
+        "destructive_action",
+        "service_interruption",
+        "product_decision",
+        "art_decision",
+    ],
+)
+def test_block_task_allows_first_run_human_gate_categories(
+    kanban_home,
+    reason_category,
+):
+    """Fresh workers can block immediately for explicit human-gate reasons."""
+    with kb.connect() as conn:
+        task_id = _create_claimed_task_with_review_visits(conn, 0)
+
+        assert kb.block_task(
+            conn,
+            task_id,
+            reason=f"need human gate: {reason_category}",
+            reason_category=reason_category,
+        ) is True
+
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "blocked"
+        blocked_events = [e for e in kb.list_events(conn, task_id) if e.kind == "blocked"]
+        assert len(blocked_events) == 1
+        assert blocked_events[-1].payload["human_gate"] is True
+        assert blocked_events[-1].payload["reason_category"] == reason_category
+
+
+def test_block_task_allows_first_run_human_gate_flag_without_category(kanban_home):
+    """The CLI can expose a simple --human-gate flag without forcing a category."""
+    with kb.connect() as conn:
+        task_id = _create_claimed_task_with_review_visits(conn, 0)
+
+        assert kb.block_task(
+            conn,
+            task_id,
+            reason="need a human product choice",
+            human_gate=True,
+        ) is True
+
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "blocked"
+        blocked_event = [e for e in kb.list_events(conn, task_id) if e.kind == "blocked"][-1]
+        assert blocked_event.payload["human_gate"] is True
+
+
+def test_block_task_rejects_unknown_human_gate_category(kanban_home):
+    """Human-gate categories are explicit so typos do not silently bypass review."""
+    with kb.connect() as conn:
+        task_id = _create_claimed_task_with_review_visits(conn, 0)
+
+        with pytest.raises(ValueError, match="Invalid human-gate reason category"):
+            kb.block_task(
+                conn,
+                task_id,
+                reason="need something vague",
+                reason_category="misc",
+            )
+
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "running"
+
+
 def test_block_task_allows_two_prior_review_visits(kanban_home):
     """Two prior Review visits satisfy the Blocked transition rule."""
     with kb.connect() as conn:

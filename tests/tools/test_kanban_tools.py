@@ -318,6 +318,34 @@ def test_complete_happy_path(worker_env):
         conn.close()
 
 
+def test_complete_substantial_handoff_routes_to_reviewer(worker_env):
+    """Routine implementation handoffs use kanban_complete review routing, not Blocked."""
+    from tools import kanban_tools as kt
+
+    out = kt._handle_complete({
+        "summary": "implemented feature with tests",
+        "metadata": {"changed_files": ["app.py"], "tests_run": 3},
+    })
+    d = json.loads(out)
+    assert d["ok"] is True
+
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, worker_env)
+        assert task is not None
+        assert task.status == "review"
+        assert task.assignee == "reviewer"
+        run = kb.latest_run(conn, worker_env)
+        assert run is not None
+        assert run.outcome == "review_requested"
+        review_events = [e for e in kb.list_events(conn, worker_env) if e.kind == "review_requested"]
+        assert len(review_events) == 1
+        assert review_events[-1].payload["reason"] == "changed_files"
+    finally:
+        conn.close()
+
+
 def test_complete_metadata_round_trips_through_show(worker_env):
     """Structured completion metadata should be visible to downstream agents."""
     from tools import kanban_tools as kt
@@ -631,10 +659,33 @@ def test_block_happy_path(worker_env):
         conn.close()
 
 
-def test_block_reports_review_prerequisite_error(worker_env):
+def test_block_allows_fresh_worker_human_gate(worker_env):
     from tools import kanban_tools as kt
 
-    out = kt._handle_block({"reason": "need clarification"})
+    out = kt._handle_block({
+        "reason": "Need API credentials before I can continue",
+        "reason_category": "credential",
+    })
+    d = json.loads(out)
+    assert d["ok"] is True
+
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, worker_env)
+        assert task is not None
+        assert task.status == "blocked"
+        blocked_event = [e for e in kb.list_events(conn, worker_env) if e.kind == "blocked"][-1]
+        assert blocked_event.payload["human_gate"] is True
+        assert blocked_event.payload["reason_category"] == "credential"
+    finally:
+        conn.close()
+
+
+def test_block_without_human_gate_reports_review_prerequisite_error(worker_env):
+    from tools import kanban_tools as kt
+
+    out = kt._handle_block({"reason": "implementation handoff parked as blocked"})
     d = json.loads(out)
 
     assert d.get("error")

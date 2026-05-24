@@ -569,9 +569,35 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
 
     p_block = sub.add_parser("block", help="Mark one or more tasks blocked")
     p_block.add_argument("task_id")
-    p_block.add_argument("reason", nargs="*", help="Reason (also appended as a comment)")
     p_block.add_argument("--ids", nargs="+", default=None,
                          help="Additional task ids to block with the same reason (bulk mode)")
+    p_block.add_argument(
+        "--human-gate",
+        action="store_true",
+        help=(
+            "Explicitly mark this as a genuine first-run human gate "
+            "(credential, human decision, destructive-action approval, "
+            "service interruption, or product/art decision). Routine "
+            "implementation handoffs should use complete/review routing instead."
+        ),
+    )
+    p_block.add_argument(
+        "--reason-category",
+        choices=kb.HUMAN_GATE_BLOCK_REASON_CATEGORIES,
+        default=None,
+        help=(
+            "Human-gate category. Implies --human-gate and records the "
+            "category on the blocked event."
+        ),
+    )
+    p_block.add_argument(
+        "tail",
+        nargs=argparse.REMAINDER,
+        help=(
+            "Reason text. Block-specific flags may appear after task_id, "
+            "e.g. block <task> --human-gate need decision."
+        ),
+    )
 
     p_schedule = sub.add_parser("schedule", help="Park one or more tasks in Scheduled (waiting on time, not human input)")
     p_schedule.add_argument("task_id")
@@ -2023,9 +2049,51 @@ def _cmd_edit(args: argparse.Namespace) -> int:
 
 
 def _cmd_block(args: argparse.Namespace) -> int:
-    reason = " ".join(args.reason).strip() if args.reason else None
+    tail = list(getattr(args, "tail", None) or getattr(args, "reason", None) or [])
+    human_gate = bool(getattr(args, "human_gate", False))
+    reason_category = getattr(args, "reason_category", None)
+    extra_ids = list(getattr(args, "ids", None) or [])
+    reason_parts: list[str] = []
+    idx = 0
+    while idx < len(tail):
+        token = tail[idx]
+        if token == "--human-gate":
+            human_gate = True
+            idx += 1
+            continue
+        if token == "--reason-category":
+            if idx + 1 >= len(tail):
+                print("kanban block: --reason-category requires a value", file=sys.stderr)
+                return 2
+            reason_category = tail[idx + 1]
+            human_gate = True
+            idx += 2
+            continue
+        if token.startswith("--reason-category="):
+            reason_category = token.split("=", 1)[1]
+            human_gate = True
+            idx += 1
+            continue
+        if token == "--ids":
+            idx += 1
+            if idx >= len(tail) or tail[idx].startswith("--"):
+                print("kanban block: --ids requires at least one task id", file=sys.stderr)
+                return 2
+            while idx < len(tail) and not tail[idx].startswith("--"):
+                extra_ids.append(tail[idx])
+                idx += 1
+            continue
+        if token.startswith("--ids="):
+            extra_ids.extend(
+                part for part in token.split("=", 1)[1].split(",") if part
+            )
+            idx += 1
+            continue
+        reason_parts.append(token)
+        idx += 1
+    reason = " ".join(reason_parts).strip() if reason_parts else None
     author = _profile_author()
-    ids = [args.task_id] + list(getattr(args, "ids", None) or [])
+    ids = [args.task_id] + extra_ids
     failed: list[str] = []
     with kb.connect() as conn:
         for tid in ids:
@@ -2037,6 +2105,8 @@ def _cmd_block(args: argparse.Namespace) -> int:
                     tid,
                     reason=reason,
                     expected_run_id=_worker_run_id_for(tid),
+                    human_gate=human_gate,
+                    reason_category=reason_category,
                 )
             except ValueError as exc:
                 failed.append(tid)
