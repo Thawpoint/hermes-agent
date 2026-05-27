@@ -4802,6 +4802,21 @@ class GatewayRunner:
             return
 
         TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out")
+
+        def _blocked_review_payload_needs_media(payload: Any) -> bool:
+            """True for blocked handoffs that should still surface media.
+
+            Image-generation workers sometimes finish a review package but
+            correctly refuse to mark quality approved, so they block with a
+            ``review-required`` reason. Those blocked events must still upload
+            media paths from the handoff comment; otherwise users get a block
+            ping with no images to review.
+            """
+            if not isinstance(payload, dict):
+                return False
+            reason = str(payload.get("reason") or "").strip().lower()
+            return "review-required" in reason or "review required" in reason
+
         # Subscriptions are removed only when the task reaches a truly final
         # status (done / archived). We used to also unsub on any terminal
         # event kind (gave_up / crashed / timed_out / blocked), but that
@@ -4914,6 +4929,16 @@ class GatewayRunner:
                                 if not events:
                                     continue
                                 task = _kb.get_task(conn, sub["task_id"])
+                                comments = []
+                                try:
+                                    if any(
+                                        ev.kind == "blocked"
+                                        and _blocked_review_payload_needs_media(ev.payload)
+                                        for ev in events
+                                    ):
+                                        comments = _kb.list_comments(conn, sub["task_id"])
+                                except Exception:
+                                    comments = []
                                 logger.debug(
                                     "kanban notifier: claimed %d event(s) for %s on board %s cursor %s→%s",
                                     len(events), sub["task_id"], slug, old_cursor, cursor,
@@ -4924,6 +4949,7 @@ class GatewayRunner:
                                     "cursor": cursor,
                                     "events": events,
                                     "task": task,
+                                    "comments": comments,
                                     "board": slug,
                                 })
                         finally:
@@ -5053,6 +5079,26 @@ class GatewayRunner:
                                         "kanban notifier: artifact delivery for %s failed: %s",
                                         sub["task_id"], art_exc,
                                     )
+                            elif kind == "blocked" and _blocked_review_payload_needs_media(getattr(ev, "payload", None)):
+                                try:
+                                    comment_texts = [
+                                        str(getattr(comment, "body", ""))
+                                        for comment in (d.get("comments") or [])
+                                        if getattr(comment, "body", "")
+                                    ]
+                                    await self._deliver_kanban_artifacts(
+                                        adapter=adapter,
+                                        chat_id=sub["chat_id"],
+                                        metadata=metadata,
+                                        event_payload=getattr(ev, "payload", None),
+                                        task=task,
+                                        extra_texts=comment_texts,
+                                    )
+                                except Exception as art_exc:
+                                    logger.debug(
+                                        "kanban notifier: blocked review artifact delivery for %s failed: %s",
+                                        sub["task_id"], art_exc,
+                                    )
                             # Reset the failure counter on success.
                             sub_fail_counts.pop(sub_key, None)
                         except Exception as exc:
@@ -5178,18 +5224,22 @@ class GatewayRunner:
         metadata: dict,
         event_payload: Optional[dict],
         task,
+        extra_texts: Optional[list[str]] = None,
     ) -> None:
-        """Upload artifact files referenced by a completed kanban task.
+        """Upload artifact files referenced by a kanban task notification.
 
         Workers passing ``kanban_complete(artifacts=[...])`` ship absolute
         file paths through the completion event so downstream humans get
         the deliverable as a native upload instead of a path printed in
-        chat.
+        chat. Review-required blocked events can also surface paths from
+        the worker handoff comment so "not approved yet" does not mean
+        "no images delivered".
 
         Sources scanned, in priority order:
           1. ``event_payload['artifacts']`` (explicit list — preferred)
-          2. ``event_payload['summary']`` (truncated first line)
-          3. ``task.result`` (legacy fallback)
+          2. ``event_payload['summary']`` / ``event_payload['reason']``
+          3. ``extra_texts`` (for blocked review handoff comments)
+          4. ``task.result`` (legacy fallback)
 
         Files are deduplicated, missing files are silently skipped (the
         path may have been mentioned for reference only), and delivery
@@ -5219,14 +5269,23 @@ class GatewayRunner:
                     if isinstance(item, str):
                         _add(item)
 
-            # 2. Paths embedded in the payload summary.
-            summary = event_payload.get("summary")
-            if isinstance(summary, str) and summary:
-                paths, _ = adapter.extract_local_files(summary)
+            # 2. Paths embedded in the payload summary or block reason.
+            for key in ("summary", "reason"):
+                text = event_payload.get(key)
+                if isinstance(text, str) and text:
+                    paths, _ = adapter.extract_local_files(text)
+                    for p in paths:
+                        _add(p)
+
+        # 3. Paths embedded in extra handoff text, such as comments on a
+        # review-required blocked image task.
+        for text in extra_texts or []:
+            if isinstance(text, str) and text:
+                paths, _ = adapter.extract_local_files(text)
                 for p in paths:
                     _add(p)
 
-        # 3. Legacy: paths embedded in task.result.
+        # 4. Legacy: paths embedded in task.result.
         if task is not None and getattr(task, "result", None):
             result_text = str(task.result)
             paths, _ = adapter.extract_local_files(result_text)

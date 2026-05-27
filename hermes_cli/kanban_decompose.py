@@ -77,6 +77,13 @@ Output a single JSON object with this exact shape:
   }
 
 Rules:
+  - Preserve the user's scope. If the request is a simple exploratory
+    question or audit, keep it as one bounded discovery task unless there is
+    a clear independent implementation/review pipeline.
+  - For broad repo audits, require the worker to use concise discovery
+    scripts/batched reads and produce a focused handoff; do not expand a
+    small question into an exhaustive architecture review unless the user
+    asked for that depth.
   - "parents" is a list of INDICES (0-based) into this same "tasks" list,
     expressing actual data dependencies. Tasks with no parents run in
     PARALLEL. Tasks with parents wait until every parent completes.

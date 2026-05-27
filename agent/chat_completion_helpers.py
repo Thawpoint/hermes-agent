@@ -1121,6 +1121,58 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
 
 
 
+def _persist_kanban_iteration_limit_summary(agent, final_response: str) -> None:
+    """Persist a max-iteration final summary for dispatcher-spawned workers.
+
+    At the iteration cap the agent asks the model for a no-tools summary and
+    then returns to the caller. A Kanban worker has no remaining tool turn to
+    call ``kanban_complete`` or ``kanban_block``, so without this safety net the
+    subprocess exits cleanly while the task stays running; the dispatcher later
+    reports a protocol violation with no usable handoff. We block rather than
+    auto-complete because a budget-exhausted worker may have produced a useful
+    summary for incomplete work, not a verified terminal result.
+    """
+    task_id = os.environ.get("HERMES_KANBAN_TASK", "").strip()
+    if not task_id or not final_response or not final_response.strip():
+        return
+    if os.environ.get("HERMES_KANBAN_PERSIST_ITERATION_SUMMARY", "1").strip().lower() in {
+        "0", "false", "no", "off"
+    }:
+        return
+
+    try:
+        from hermes_cli import kanban_db as kb
+
+        author = (
+            os.environ.get("HERMES_PROFILE")
+            or getattr(agent, "profile", None)
+            or os.environ.get("USER")
+            or "kanban-worker"
+        )
+        comment_body = (
+            "iteration-budget final summary (auto-persisted because the worker "
+            "hit its tool-call limit before it could call kanban_complete or "
+            "kanban_block):\n\n"
+            f"{final_response.strip()}"
+        )
+        reason = (
+            "iteration-budget: worker reached max iterations after producing "
+            "a final summary; summary was auto-persisted in the task comments"
+        )
+        conn = kb.connect()
+        try:
+            kb.add_comment(conn, task_id, str(author), comment_body)
+            kb.block_task(conn, task_id, reason=reason)
+        finally:
+            conn.close()
+    except Exception as exc:  # pragma: no cover - best-effort safety net
+        logger.warning(
+            "Failed to persist kanban iteration-limit summary for %s: %s",
+            task_id,
+            exc,
+        )
+
+
 def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
     """Request a summary when max iterations are reached. Returns the final response text."""
     print(f"⚠️  Reached maximum iterations ({agent.max_iterations}). Requesting summary...")
@@ -1335,8 +1387,8 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
         logger.warning(f"Failed to get summary response: {e}")
         final_response = f"I reached the maximum iterations ({agent.max_iterations}) but couldn't summarize. Error: {str(e)}"
 
+    _persist_kanban_iteration_limit_summary(agent, final_response)
     return final_response
-
 
 
 def cleanup_task_resources(agent, task_id: str) -> None:

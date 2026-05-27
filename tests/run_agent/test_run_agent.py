@@ -2519,6 +2519,56 @@ class TestHandleMaxIterations:
         assert "error" in result.lower()
         assert "API down" in result
 
+    def test_kanban_worker_summary_is_persisted_before_iteration_limit_exit(
+        self, agent, tmp_path, monkeypatch
+    ):
+        """Regression: max-iteration summaries from kanban workers must not vanish.
+
+        A worker that exhausts its loop cannot call kanban_complete/kanban_block
+        after the final no-tools summary response. The summary handler should
+        persist that handoff and transition the card itself so crash detection
+        does not later report a no-deliverable protocol violation.
+        """
+        import hermes_cli.kanban_db as kb
+
+        monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
+        monkeypatch.setenv("HERMES_KANBAN_BOARD", "default")
+
+        conn = kb.connect()
+        try:
+            tid = kb.create_task(
+                conn,
+                title="Audit a simple thing",
+                assignee="coder",
+            )
+        finally:
+            conn.close()
+
+        monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+        monkeypatch.setenv("HERMES_PROFILE", "coder")
+
+        agent.client.chat.completions.create.return_value = _mock_response(
+            content="Audit summary: nothing needs changing; here is the handoff."
+        )
+        agent._cached_system_prompt = "You are helpful."
+
+        result = agent._handle_max_iterations(
+            [{"role": "user", "content": "audit this"}], 90
+        )
+
+        assert result.startswith("Audit summary:")
+        conn = kb.connect()
+        try:
+            task = kb.get_task(conn, tid)
+            comments = kb.list_comments(conn, tid)
+            runs = kb.list_runs(conn, tid)
+            assert task is not None
+            assert task.status == "blocked"
+            assert any("Audit summary: nothing needs changing" in c.body for c in comments)
+            assert any("iteration-budget" in (r.summary or "") for r in runs)
+        finally:
+            conn.close()
+
     def test_summary_skips_reasoning_for_unsupported_openrouter_model(self, agent):
         agent.base_url = "https://openrouter.ai/api/v1"
         agent.model = "minimax/minimax-m2.5"

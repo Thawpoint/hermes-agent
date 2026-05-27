@@ -584,6 +584,103 @@ async def test_notifier_uploads_artifacts_on_completion(kanban_home, tmp_path, m
 
 
 @pytest.mark.asyncio
+async def test_notifier_uploads_review_required_block_comment_images(kanban_home, tmp_path, monkeypatch):
+    """A review-required blocked image handoff must not strand media paths.
+
+    NBN/Qwen image workers can produce real review media, leave the paths in
+    a handoff comment, and then block with ``review-required`` so a human can
+    judge quality. The user must still receive the actual image attachments;
+    otherwise the card is blocked and dependent handoff tasks stay gated with
+    no Telegram media.
+    """
+    import hermes_cli.kanban_db as kb
+    from gateway.run import GatewayRunner
+    from gateway.config import Platform
+
+    contact_path = tmp_path / "selected_candidates_contact_sheet.png"
+    contact_path.write_bytes(b"PNG-contact")
+    candidate_path = tmp_path / "06_p2_sleeping_full_lounger.png"
+    candidate_path.write_bytes(b"PNG-candidate")
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="Run iterative Qwen-native Lapis sprite tests",
+            assignee="image-generator",
+        )
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat1")
+        kb.add_comment(
+            conn,
+            tid,
+            author="image-generator",
+            body=(
+                "review-required handoff:\n"
+                f"Selected sheet: {contact_path}\n"
+                f"Best candidate: {candidate_path}\n"
+                "Only Gibs can approve quality."
+            ),
+        )
+        kb.block_task(
+            conn,
+            tid,
+            reason=(
+                "review-required: Qwen Lapis pool-lounger package is ready "
+                "for Gibs Telegram review."
+            ),
+        )
+    finally:
+        conn.close()
+
+    runner = object.__new__(GatewayRunner)
+    runner._running = True
+    runner._kanban_sub_fail_counts = {}
+
+    fake_adapter = MagicMock()
+    fake_adapter.name = "telegram"
+
+    sends: list[tuple[str, str]] = []
+    images_uploaded: list[str] = []
+
+    async def _send(chat_id, msg, metadata=None):
+        sends.append((chat_id, msg))
+        runner._running = False
+
+    async def _send_images(chat_id, images, metadata=None, **_kw):
+        images_uploaded.extend(p for p, _ in images)
+
+    fake_adapter.send = AsyncMock(side_effect=_send)
+    fake_adapter.send_multiple_images = AsyncMock(side_effect=_send_images)
+    from gateway.platforms.base import BasePlatformAdapter
+    fake_adapter.extract_local_files = BasePlatformAdapter.extract_local_files
+
+    runner.adapters = {Platform.TELEGRAM: fake_adapter}
+
+    _orig_sleep = asyncio.sleep
+
+    async def _fast_sleep(_):
+        await _orig_sleep(0)
+
+    with patch("gateway.run.asyncio.sleep", side_effect=_fast_sleep):
+        await asyncio.wait_for(
+            runner._kanban_notifier_watcher(interval=1),
+            timeout=10.0,
+        )
+
+    assert len(sends) == 1
+    assert "blocked" in sends[0][1]
+    assert any("selected_candidates_contact_sheet.png" in p for p in images_uploaded), images_uploaded
+    assert any("06_p2_sleeping_full_lounger.png" in p for p in images_uploaded), images_uploaded
+
+    conn = kb.connect()
+    try:
+        # Blocked cards keep the subscription so retries/reblocks still notify.
+        assert kb.list_notify_subs(conn, tid)
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
 async def test_notifier_artifact_delivery_skips_missing_files(kanban_home, tmp_path, monkeypatch):
     """Missing artifact paths are silently skipped — they may have been
     referenced by name only. The notifier must not crash and must still
